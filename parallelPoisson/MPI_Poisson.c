@@ -22,7 +22,7 @@ enum
 int gridsize[2];
 double precision_goal;		/* precision_goal of solution */
 int max_iter;			/* maximum number of iterations alowed */
-int proc_rank;
+double wtime;			/* wallclock time*/
 
 /* benchmark related variables */
 clock_t ticks;			/* number of systemticks */
@@ -32,6 +32,16 @@ int timer_on = 0;		/* is timer running? */
 double **phi;			/* grid */
 int **source;			/* TRUE if subgrid element is a source */
 int dim[2];			/* grid dimensions */
+
+/* process specific variables */
+int proc_rank;			/* rank of current process */
+int proc_coord[2];		/* coordinates of current process in processgrid */
+int proc_top, proc_right, proc_bottom, proc_left; 	/*ranks of neighbouring procs */
+
+int P;				/* total numberof processes */
+int P_grid[2];			/* processgrid dimensions   */
+MPI_Comm grid_comm;		/* grid communicator        */
+MPI_Status status;	
 
 void Setup_Grid();
 double Do_Step(int parity);
@@ -48,7 +58,9 @@ void start_timer()
 {
   if (!timer_on)
   {
+    MPI_Barrier(MPI_COMM_WORLD);
     ticks = clock();
+    wtime = MPI_Wtime();
     timer_on = 1;
   }
 }
@@ -58,6 +70,7 @@ void resume_timer()
   if (!timer_on)
   {
     ticks = clock() - ticks;
+    wtime = MPI_Wtime() - wtime;
     timer_on = 1;
   }
 }
@@ -67,6 +80,7 @@ void stop_timer()
   if (timer_on)
   {
     ticks = clock() - ticks;
+    wtime = MPI_Wtime() - wtime;
     timer_on = 0;
   }
 }
@@ -76,11 +90,13 @@ void print_timer()
   if (timer_on)
   {
     stop_timer();
-    printf("Elapsed processortime: %14.6f s\n", ticks * (1.0 / CLOCKS_PER_SEC));
+    printf("(%i) Elapsed Wtime: %14.6f s (%5.1f%% CPU)\n", 
+      proc_rank, wtime, 100.0 * ticks * (1.0 / CLOCKS_PER_SEC) / wtime);
     resume_timer();
   }
   else
-    printf("Elapsed processortime: %14.6f s\n", ticks * (1.0 / CLOCKS_PER_SEC));
+    printf("(%i) Elapsed Wtime: %14.6f s (%5.1f%% CPU)\n", 
+      proc_rank, wtime, 100.0 * ticks * (1.0 / CLOCKS_PER_SEC) / wtime);
 }
 
 void Debug(char *mesg, int terminate)
@@ -98,14 +114,21 @@ void Setup_Grid()
   FILE *f;
 
   Debug("Setup_Subgrid", 0);
+  
+  if (proc_rank == 0)			/* only process 0 may execute this if */
+  {
+    f = fopen("input.dat", "r");
+    if (f == NULL)
+      Debug("Error opening input.dat", 1);
+    fscanf(f, "nx: %i\n", &gridsize[X_DIR]);
+    fscanf(f, "ny: %i\n", &gridsize[Y_DIR]);
+    fscanf(f, "precision goal: %lf\n", &precision_goal);
+    fscanf(f, "max iterations: %i\n", &max_iter);
+  }
+  MPI_Bcast(gridsize, 2, MPI_INT, 0, MPI_COMM_WORLD);  /* broadcast the array gridsize in one call */
+  MPI_Bcast(&precision_goal, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);  /* broadcast precision_goal */  
+  MPI_Bcast(&max_iter, 1, MPI_INT, 0, MPI_COMM_WORLD);	     /* broadcast max_iter       */
 
-  f = fopen("input.dat", "r");
-  if (f == NULL)
-    Debug("Error opening input.dat", 1);
-  fscanf(f, "nx: %i\n", &gridsize[X_DIR]);
-  fscanf(f, "ny: %i\n", &gridsize[Y_DIR]);
-  fscanf(f, "precision goal: %lf\n", &precision_goal);
-  fscanf(f, "max iterations: %i\n", &max_iter);
 
   /* Calculate dimensions of local subgrid */
   dim[X_DIR] = gridsize[X_DIR] + 2;
@@ -137,9 +160,17 @@ void Setup_Grid()
   /* put sources in field */
   do
   {
-    s = fscanf(f, "source: %lf %lf %lf\n", &source_x, &source_y, &source_val);
+    if (proc_rank == 0)			/* only process 0 may scan next line of input */
+      s = fscanf(f, "source: %lf %lf %lf\n", &source_x, &source_y, &source_val);
+       
+    MPI_Bcast(&s, 1, MPI_INT, 0, MPI_COMM_WORLD);	/* The return value of this scan is broadcast 
+							   even though it is no input data  */
+
     if (s==3)
-    {
+    {    
+      MPI_Bcast(&source_x, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);	/* broadcast source_x */
+      MPI_Bcast(&source_y, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);	/* broadcast source_y */
+      MPI_Bcast(&source_val, 1, MPI_DOUBLE, 0, MPI_COMM_WORLD);	/* broadcast source_val */
       x = source_x * gridsize[X_DIR];
       y = source_y * gridsize[Y_DIR];
       x += 1;
@@ -150,7 +181,8 @@ void Setup_Grid()
   }
   while (s==3);
 
-  fclose(f);
+  if (proc_rank == 0) fclose(f);	/* only process 0 may close the file */
+
 }
 
 double Do_Step(int parity)
@@ -205,7 +237,11 @@ void Write_Grid()
   int x, y;
   FILE *f;
 
-  if ((f = fopen("output.dat", "w")) == NULL)
+  char filename[40];
+
+  sprintf(filename, "output%i.dat", proc_rank);
+
+  if ((f = fopen(filename, "w")) == NULL)
     Debug("Write_Grid : fopen failed", 1);
 
   Debug("Write_Grid", 0);
@@ -228,14 +264,59 @@ void Clean_Up()
 }
 
 
+void Setup_Proc_Grid(int argc, char **argv)
+{
+  int wrap_around[2];
+  int reorder;
+
+  Debug("My_MPI_Init", 0);
+
+  /* Retrieve the number of processes */
+  MPI_Comm_size(MPI_COMM_WORLD, &P);		/* find out how many processes there are  */
+
+  /* Calculate the number of processes per column and per row for the grid */
+  if(argc > 2)
+  {
+    P_grid[X_DIR] = atoi(argv[1]);
+    P_grid[Y_DIR] = atoi(argv[2]);
+    if (P_grid[X_DIR] * P_grid[Y_DIR] != P)
+      Debug("ERROR : Process grid dimensions do not match with P ", 1);
+  }
+  else
+    Debug("ERROR : Wrong parameter input", 1);
+
+  /* Create process topology (2D grid) */
+  wrap_around[X_DIR] = 0;
+  wrap_around[Y_DIR] = 0;		/* do not connect first and last process */
+  reorder = 1;				/* reorder process ranks 		 */
+ 
+  MPI_Cart_create(MPI_COMM_WORLD, 2, P_grid, wrap_around, reorder, &grid_comm); 
+							/* Creates a new communicator: grid_comm */
+
+  /* Retrieve new rank and cartesian coordinates of this process */
+  MPI_Comm_rank(grid_comm, &proc_rank);			/* Rank of process in new communicator   */
+  MPI_Cart_coords(grid_comm, proc_rank, 2, proc_coord);/* Coordinates of process in new communicator */
+
+  printf("(%i) (x,y)=(%i,%i)\n", proc_rank, proc_coord[X_DIR], proc_coord[Y_DIR]);
+
+  /* calculate ranks of neighbouring processes */
+  MPI_Cart_shift(grid_comm, Y_DIR, 1, &proc_top, &proc_bottom);	/* rank of processes proc_top 
+								and proc_bottom */
+  MPI_Cart_shift(grid_comm, X_DIR, 1, &proc_left, &proc_right);	/* rank of processes proc_left 
+								and proc_right */
+ 
+  if (DEBUG)
+    printf("(%i) top %i, right %i, bottom %i, left %i\n",
+           proc_rank, proc_top, proc_right, proc_bottom, proc_left);
+}
+
+
 int main(int argc, char **argv)
 {
   MPI_Init(&argc, &argv); 
 
-  MPI_Comm_rank(MPI_COMM_WORLD, &proc_rank);
-
-  MPI_Finalize();
-
+  Setup_Proc_Grid(argc, argv);
+  
   start_timer();
 
   Setup_Grid();
@@ -247,6 +328,8 @@ int main(int argc, char **argv)
   print_timer();
 
   Clean_Up();
+
+  MPI_Finalize();
 
   return 0;
 }
