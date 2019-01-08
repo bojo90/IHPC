@@ -1,2 +1,2 @@
-.dat
-MPI_Poisson
+*/**/*.dat
+*/**/MPI_Poisson
