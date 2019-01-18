@@ -1,2 +1,4 @@
 */**/*.dat
 */**/MPI_Poisson
+*/**/*.job
+*/**/*.out
