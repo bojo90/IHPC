@@ -18,6 +18,8 @@ float* h_MatA = NULL;
 float* d_MatA = NULL;
 
 // Output Array
+float* h_Lamda = NULL;
+float* d_Lamda = NULL;
 float* h_VecV = NULL;
 float* d_VecV = NULL;
 float* h_VecW = NULL;
@@ -37,13 +39,14 @@ void Cleanup(void);
 void InitOne(float*, int);
 void UploadArray(float*, int);
 float CPUReduce(float*, int);
-void  Arguments(int, char**);
+void  ParseArguments(int, char**);
 void checkCardVersion(void);
+void checkCudaError(cudaError_t, const char[], int);
 
 // Kernels
 __global__ void Av_Product(float* g_MatA, float* g_VecV, float* g_VecW, int N);
 __global__ void FindNormW(float* g_VecW, float * g_NormW, int N);
-__global__ void NormalizeW(float* g_VecV,float* g_VecW, int N);
+__global__ void NormalizeW(float* g_VecW, float * g_NormW, float* g_VecV, int N); 
 __global__ void ComputeLamda( float* g_VecV,float* g_VecW, float * g_Lamda,int N);
 
 
@@ -69,8 +72,10 @@ void CPU_NormalizeW()
 	float normW=0;
 	for(int i=0;i<N;i++)
 		normW += h_VecW[i] * h_VecW[i];
-	
+
 	normW = sqrt(normW);
+
+    printf("NormW-CPU: %f\n", normW);    
 	for(int i=0;i<N;i++)
 		h_VecV[i] = h_VecW[i]/normW;
 }
@@ -111,6 +116,7 @@ void RunCPUPowerMethod()
 	
 }
 
+
 // Host code
 int main(int argc, char** argv)
 {
@@ -133,6 +139,8 @@ int main(int argc, char** argv)
     h_VecV = (float*)malloc(vec_size);
     // Allocate W vector for computations
     h_VecW = (float*)malloc(vec_size);
+    // Allocate lamda value in host memory
+    h_Lamda = (float *)malloc(norm_size);
 
 
     // Initialize input matrix
@@ -163,22 +171,88 @@ int main(int argc, char** argv)
     int sharedMemSize = threadsPerBlock * threadsPerBlock * sizeof(float); // in per block, the memory is shared   
     int blocksPerGrid = (N + threadsPerBlock - 1) / threadsPerBlock;
 
+    cudaError_t cuda_err;
     // Allocate matrix and vectors in device memory
-    cudaMalloc((void**)&d_MatA, mat_size); 
-    cudaMalloc((void**)&d_VecV, vec_size); 
-    cudaMalloc((void**)&d_VecW, vec_size); // This vector is only used by the device
-    cudaMalloc((void**)&d_NormW, norm_size); 
+    cuda_err = cudaMalloc((void**)&d_MatA, mat_size);
+    checkCudaError(cuda_err, "Error Allocating Matrix", 1);
+    cuda_err = cudaMalloc((void**)&d_VecV, vec_size);
+    checkCudaError(cuda_err, "Error Allocating Vector", 1);
+    cuda_err = cudaMalloc((void**)&d_VecW, vec_size); // This vector is only used by the device
+    checkCudaError(cuda_err, "Error Allocating Normal Vector", 1);
+    cuda_err = cudaMalloc((void**)&d_NormW, norm_size); 
+    checkCudaError(cuda_err, "Error Value for Normallised Eigen Vector", 1);
+    cuda_err = cudaMalloc((void**)&d_Lamda, norm_size);
+    checkCudaError(cuda_err, "Error Allocating Lamda", 1);
+
+
+    cuda_err = cudaMemset(d_VecW, 0, vec_size);
+    checkCudaError(cuda_err, "Error Setting Vector Size", 1);
 
     //Copy from host memory to device memory
-    cudaMemcpy(d_MatA, h_MatA, mat_size, cudaMemcpyHostToDevice);
-    cudaMemcpy(d_VecV, h_VecV, vec_size, cudaMemcpyHostToDevice);
+    cuda_err = cudaMemcpy(d_MatA, h_MatA, mat_size, cudaMemcpyHostToDevice);
+    checkCudaError(cuda_err, "Error Copying host matrix to device", 1);
+    cuda_err = cudaMemcpy(d_VecV, h_VecV, vec_size, cudaMemcpyHostToDevice);
+    checkCudaError(cuda_err, "Error Copying host vector to device", 1);
 	// cutilCheckError(cutStopTimer(timer_mem));
 	  
    //Power method loops
     float OldLamda =0;
     
     Av_Product<<<blocksPerGrid, threadsPerBlock, sharedMemSize>>>(d_MatA, d_VecV, d_VecW, N);
-    cudaThreadSynchronize(); //Needed, kind of barrier to sychronize all threads
+    cuda_err = cudaGetLastError();
+    checkCudaError(cuda_err, "Sync Error with Av_Product", 1);
+    cuda_err = cudaDeviceSynchronize();
+    checkCudaError(cuda_err, "Async Error with Av_Product", 1);
+
+    for (int idx = 0; idx < max_iteration; idx++) {
+
+        cuda_err = cudaMemset(d_NormW, 0, norm_size);
+
+        FindNormW<<<blocksPerGrid, threadsPerBlock, sharedMemSize >>> (d_VecW, d_NormW, N);
+
+        cuda_err = cudaGetLastError();
+        checkCudaError(cuda_err, "Sync Error with FindNormW", 1);
+        cuda_err = cudaThreadSynchronize();
+        checkCudaError(cuda_err, "Async Error with FindNormW", 1);  
+        cuda_err = cudaMemcpy(h_NormW, d_NormW, norm_size, cudaMemcpyDeviceToHost);
+        checkCudaError(cuda_err, "Error copying NormW to Host", 1);
+
+        
+        h_NormW[0] = sqrt(h_NormW[0]);
+        cuda_err = cudaMemcpy(d_NormW, h_NormW, norm_size, cudaMemcpyHostToDevice);
+        checkCudaError(cuda_err, "Error Setting new value of NormW on Device", 1);
+
+        NormalizeW<<<blocksPerGrid, threadsPerBlock, sharedMemSize >>> (d_VecW, d_NormW, d_VecV, N);
+        cuda_err = cudaGetLastError();
+        checkCudaError(cuda_err, "Sync Error with Normalize W", 1);
+        cuda_err = cudaThreadSynchronize();
+        checkCudaError(cuda_err, "Async Error with NormalizeW", 1);
+        
+        Av_Product<<<blocksPerGrid, threadsPerBlock, sharedMemSize>>>(d_MatA, d_VecV, d_VecW, N);
+        cuda_err = cudaGetLastError();
+        checkCudaError(cuda_err, "Sync Error with Av_Product", 1);
+        cuda_err = cudaDeviceSynchronize();
+        checkCudaError(cuda_err, "Async Error with Av_Product", 1);
+        
+        cuda_err = cudaMemset(d_Lamda, 0, norm_size);
+        checkCudaError(cuda_err, "Error Setting value of lamda to zero", 1);
+        
+        ComputeLamda<<<blocksPerGrid, threadsPerBlock, sharedMemSize >>>  (d_VecV, d_VecW, d_Lamda, N);
+        cuda_err = cudaGetLastError();
+        checkCudaError(cuda_err, "Sync Error with Compute Lamda", 1);
+
+        cuda_err = cudaThreadSynchronize();
+        checkCudaError(cuda_err, "Async Error with Compute Lamda", 1);
+
+        cuda_err = cudaMemcpy(h_Lamda, d_Lamda, norm_size, cudaMemcpyDeviceToHost);
+        checkCudaError(cuda_err, "Error copying device lamda to host", 1);
+
+        printf("GPU lamda at %d: %f \n", idx, h_Lamda[0]);
+
+        if(abs(OldLamda - h_Lamda[0]) < EPS)
+			break;
+        OldLamda = h_Lamda[0];
+    }
 	
     // This part is the main code of the iteration process for the Power Method in GPU. 
     // Please finish this part based on the given code. Do not forget the command line 
@@ -213,8 +287,10 @@ void Cleanup(void)
         cudaFree(d_VecV);
     if (d_VecW)
         cudaFree(d_VecW);
-	  if (d_NormW)
-		    cudaFree(d_NormW);
+	if (d_NormW)
+		  cudaFree(d_NormW);
+    if (d_Lamda)
+        cudaFree(d_Lamda);
 		
     // Free host memory
     if (h_MatA)
@@ -225,6 +301,8 @@ void Cleanup(void)
         free(h_VecW);
     if (h_NormW)
         free(h_NormW);
+    if (h_Lamda)
+        free(h_Lamda);
     
     exit(0);
 }
@@ -250,7 +328,7 @@ void UploadArray(float* data, int n)
 }
 
 // Obtain program arguments
-void Arguments(int argc, char** argv)
+void ParseArguments(int argc, char** argv)
 {
     for (int i = 0; i < argc; ++i) 
     {
@@ -280,4 +358,172 @@ void checkCardVersion()
       fprintf(stderr,"Need compute capability 2 or higher.\n");
       exit(1);
    }
+}
+
+/*****************************************************************************
+This function finds the product of Matrix A and vector V
+*****************************************************************************/
+
+// ****************************************************************************************************************************************************/
+// parallelization method for the Matrix-vector multiplication as follows:
+
+// each thread handle a multiplication of each row of Matrix A and vector V;
+
+// The share memory is limited for a block, instead of reading an entire row of matrix A or vector V from global memory to share memory,
+// a square submatrix of A is shared by a block, the size of square submatrix is BLOCK_SIZE*BLOCK_SIZE; Thus, a for-loop is used to
+// handle a multiplication of each row of Matrix A and vector V step by step. In eacg step, two subvectors with size BLOCK_SIZE is multiplied.
+//*****************************************************************************************************************************************************/
+
+
+__global__ void Av_Product(float* g_MatA, float* g_VecV, float* g_VecW, int N)
+{
+    // Block index
+    int bx = blockIdx.x;
+
+    // Thread index
+    int tx = threadIdx.x;
+
+    int aBegin = N * BLOCK_SIZE * bx;
+
+    int aEnd   = aBegin + N - 1;
+    int step  = BLOCK_SIZE;
+
+    int bBegin = 0;//BLOCK_SIZE * bx;
+    int bIndex=0;
+    int aIndex =0;
+    float Csub = 0;
+
+    for (int a = aBegin, b = bBegin;
+         a <= aEnd;
+         a += step, b += step)
+    {
+
+        __shared__ float As[BLOCK_SIZE*BLOCK_SIZE];
+
+        __shared__ float bs[BLOCK_SIZE];
+
+
+        for (int aa = 0; aa < BLOCK_SIZE;aa+= 1)
+        {
+            aIndex = a+tx+aa*N;
+            if( aIndex < N*N)
+        	    As[tx+aa*BLOCK_SIZE] = g_MatA[aIndex];
+		        else
+        	    As[tx+aa*BLOCK_SIZE] = 0;
+        }
+
+        bIndex = b+tx;
+   	    if(bIndex<N)
+		      bs[tx] = g_VecV[bIndex];
+	      else
+		      bs[tx] = 0;
+
+        __syncthreads();
+
+        for (int k = 0; k < BLOCK_SIZE; ++k)
+        {
+            Csub += As[k+tx*BLOCK_SIZE] * bs[k];
+        }//}
+        __syncthreads();
+    }
+
+    g_VecW[ BLOCK_SIZE * bx + tx] = Csub;
+}
+
+
+__global__ void ComputeLamda( float* g_VecV, float* g_VecW, float * g_Lamda,int N)
+{
+  // shared memory size declared at kernel launch
+  extern __shared__ float sdataVW[];
+  unsigned int tid = threadIdx.x;
+  unsigned int globalid = blockIdx.x*blockDim.x + threadIdx.x;
+
+  // For thread ids greater than data space
+  if (globalid < N) {
+     sdataVW[tid] =  g_VecV[globalid] * g_VecW[globalid];
+  }
+  else {
+     sdataVW[tid] = 0;  // Case of extra threads above N
+  }
+
+  // each thread loads one element from global to shared mem
+  __syncthreads();
+
+  // do reduction in shared mem
+  for (unsigned int s=blockDim.x / 2; s > 0; s = s >> 1) {
+     if (tid < s) {
+         sdataVW[tid] = sdataVW[tid] + sdataVW[tid+ s];
+     }
+     __syncthreads();
+  }
+   // atomic operations:
+  if (tid == 0) atomicAdd(g_Lamda,sdataVW[0]);
+}
+
+
+__global__ void NormalizeW(float* g_VecW, float * g_NormW, float* g_VecV, int N)
+{
+  // shared memory size declared at kernel launch
+  extern __shared__ float sNormData[];
+  unsigned int tid = threadIdx.x;
+  unsigned int globalid = blockIdx.x*blockDim.x + threadIdx.x;
+
+  if (globalid == 0) printf("GPU Normal W: %f\n", g_NormW[0]);
+
+  if(tid==0) sNormData[0] =  g_NormW[0];
+  __syncthreads();
+
+  // For thread ids greater than data space
+  if (globalid < N) {
+     g_VecV[globalid] = g_VecW[globalid]/sNormData[0];
+  }
+
+}
+
+/****************************************************
+Normalizes vector W : W/norm(W)
+****************************************************/
+__global__ void FindNormW(float* g_VecW, float * g_NormW, int N)
+{
+  // shared memory size declared at kernel launch
+  extern __shared__ float sdata[];
+  unsigned int tid = threadIdx.x;
+  unsigned int globalid = blockIdx.x*blockDim.x + threadIdx.x;
+
+  // For thread ids greater than data space
+  if (globalid < N) {
+     sdata[tid] =  g_VecW[globalid];
+  }
+  else {
+     sdata[tid] = 0;  // Case of extra threads above N
+  }
+
+  // each thread loads one element from global to shared mem
+  __syncthreads();
+
+  sdata[tid] = sdata[tid] * sdata[tid];
+  __syncthreads();
+
+  // do reduction in shared mem
+  for (unsigned int s=blockDim.x / 2; s > 0; s = s >> 1) {
+     if (tid < s) {
+         sdata[tid] = sdata[tid] + sdata[tid+ s];
+     }
+     __syncthreads();
+  }
+   // atomic operations:
+  if (tid == 0) atomicAdd(g_NormW,sdata[0]);
+}
+
+void checkCudaError(cudaError_t cuda_err, const char mesg[], int terminate) {
+    bool isError = cuda_err != cudaSuccess;
+    if (isError) {
+        printf("Reason for Error: %s\n", cudaGetErrorString(cuda_err));
+        printf("%s\n", mesg);
+    }
+
+
+    if (isError && terminate) {
+        exit(1);
+    }
 }
