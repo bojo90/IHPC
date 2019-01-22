@@ -28,7 +28,7 @@ float* h_NormW = NULL;
 float* d_NormW = NULL;
 
 // Variables to change
-int GlobalSize = 5000;         // this is the dimension of the matrix, GlobalSize*GlobalSize
+int GlobalSize = 500;         // this is the dimension of the matrix, GlobalSize*GlobalSize
 int BlockSize = 32;            // number of threads in each block
 const float EPS = 0.000005;    // tolerence of the error
 int max_iteration = 100;       // the maximum iteration steps
@@ -39,7 +39,7 @@ void Cleanup(void);
 void InitOne(float*, int);
 void UploadArray(float*, int);
 float CPUReduce(float*, int);
-void  ParseArguments(int, char**);
+void ParseArguments(int, char**);
 void checkCardVersion(void);
 void checkCudaError(cudaError_t, const char[], int);
 
@@ -140,7 +140,7 @@ int main(int argc, char** argv)
     // Allocate W vector for computations
     h_VecW = (float*)malloc(vec_size);
     // Allocate lamda value in host memory
-    h_Lamda = (float *)malloc(norm_size);
+    h_Lamda = (float*)malloc(norm_size);
 
 
     // Initialize input matrix
@@ -226,7 +226,7 @@ int main(int argc, char** argv)
         cuda_err = cudaGetLastError();
         checkCudaError(cuda_err, "Sync Error with Normalize W", 1);
         cuda_err = cudaThreadSynchronize();
-        checkCudaError(cuda_err, "Async Error with NormalizeW", 1);
+        checkCudaError(cuda_err, "Async Error with Normalize W", 1);
         
         Av_Product<<<blocksPerGrid, threadsPerBlock, sharedMemSize>>>(d_MatA, d_VecV, d_VecW, N);
         cuda_err = cudaGetLastError();
@@ -253,21 +253,7 @@ int main(int argc, char** argv)
 			break;
         OldLamda = h_Lamda[0];
     }
-	
-    // This part is the main code of the iteration process for the Power Method in GPU. 
-    // Please finish this part based on the given code. Do not forget the command line 
-    // cudaThreadSynchronize() after callig the function every time in CUDA to synchoronize the threads
-    ////////////////////////////////////////////
-    //   ///      //        //            //          //            //        //
-    //                                                                        //
-    //                                                                        //
-    //                                                                        //
-    //                                                                        //
-    //                                                                        //
-    //                                                                        //
-    //                                                                        //
-    //  ///   //    ///     //    //      //      //        //       //   //  //
-    
+ 
     
 
     clock_gettime(CLOCK_REALTIME,&t_end);
@@ -480,9 +466,8 @@ __global__ void NormalizeW(float* g_VecW, float * g_NormW, float* g_VecV, int N)
 
 }
 
-/****************************************************
-Normalizes vector W : W/norm(W)
-****************************************************/
+
+//Normalizes vector W : W/norm(W)
 __global__ void FindNormW(float* g_VecW, float * g_NormW, int N)
 {
   // shared memory size declared at kernel launch
