@@ -1,5 +1,0 @@
-*.o
-*.out
-*.dat
-!input.dat
-!sources.dat
