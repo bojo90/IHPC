@@ -2,3 +2,4 @@
 */**/MPI_Poisson
 */**/*.job
 */**/*.out
+*/**/power_gpu
